@@ -1,0 +1,63 @@
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-md-6 col-lg-4">
+            <div class="card shadow">
+                <div class="card-body p-5">
+                    <div class="text-center mb-4">
+                        <img src="/logo.png" alt="Time Tracker Logo" class="login-logo">
+                        <h2 class="fw-bold">Admin Login</h2>
+                        <p class="text-muted">Access the Time Tracker Dashboard</p>
+                    </div>
+
+                    {{if .Error}}
+                    <div class="alert alert-danger" role="alert">
+                        <i class="fas fa-exclamation-triangle me-2"></i>
+                        {{.Error}}
+                    </div>
+                    {{end}}
+
+                    <form method="POST" action="/login">
+                        <div class="mb-3">
+                            <label for="username" class="form-label">
+                                <i class="fas fa-user me-2"></i>Username
+                            </label>
+                            <input type="text" 
+                                   class="form-control" 
+                                   id="username" 
+                                   name="username" 
+                                   required 
+                                   autofocus>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="password" class="form-label">
+                                <i class="fas fa-lock me-2"></i>Password
+                            </label>
+                            <input type="password" 
+                                   class="form-control" 
+                                   id="password" 
+                                   name="password" 
+                                   required>
+                        </div>
+
+                        {{if .TurnstileSiteKey}}
+                        <div class="mb-3 d-flex justify-content-center">
+                            <div class="cf-turnstile" 
+                                 data-sitekey="{{.TurnstileSiteKey}}" 
+                                 data-theme="light">
+                            </div>
+                        </div>
+                        {{end}}
+
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary btn-lg">
+                                <i class="fas fa-sign-in-alt me-2"></i>
+                                Sign In
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div> 

@@ -1,0 +1,46 @@
+services:
+  app:
+    build: .
+    container_name: sports-excitement-app
+    ports:
+      - "3000:3000"
+    environment:
+      # Slack Configuration
+      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN:-}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      
+      # Admin Configuration
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASS=${ADMIN_PASS:-admin}
+      
+      # Turnstile Configuration (Cloudflare)
+      - TURNSTILE_SITE_KEY=${TURNSTILE_SITE_KEY:-1x00000000000000000000AA}
+      - TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY:-1x0000000000000000000000000000000AA}
+      
+      # Database Configuration
+      - DATABASE_PATH=${DATABASE_PATH:-./data/time_tracker.db}
+      
+      # Server Configuration
+      - PORT=${PORT:-3000}
+      - SESSION_KEY=${SESSION_KEY:-your-secret-session-key}
+      
+      # Logging Configuration
+      - ENABLE_VERBOSE_LOGS=${ENABLE_VERBOSE_LOGS:-true}
+      - LOG_FILE_PATH=${LOG_FILE_PATH:-./data/tracker.log}
+      - LOG_MAX_SIZE_MB=${LOG_MAX_SIZE_MB:-10}
+      - LOG_MAX_BACKUPS=${LOG_MAX_BACKUPS:-5}
+      - LOG_MAX_AGE_DAYS=${LOG_MAX_AGE_DAYS:-30}
+    volumes:
+      # Persist database and logs
+      - app_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  app_data:
+    driver: local
