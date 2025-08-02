@@ -30,12 +30,12 @@ func SetupRoutes(app *fiber.App, wsHub *services.WebSocketHub) {
 			if store == nil {
 				initSession()
 			}
-			
+
 			sess, err := store.Get(c)
 			if err != nil || sess.Get("authenticated") != true {
 				return c.Status(fiber.StatusUnauthorized).SendString("Unauthorized")
 			}
-			
+
 			c.Locals("allowed", true)
 			c.Locals("user_id", sess.Get("user_id"))
 			c.Locals("username", sess.Get("username"))
@@ -58,8 +58,9 @@ func SetupRoutes(app *fiber.App, wsHub *services.WebSocketHub) {
 	protected.Get("/api/users", GetUsersAPI)
 	protected.Get("/api/analytics", GetAnalyticsAPI)
 	protected.Get("/api/reports/weekly", GetWeeklyReports)
-	
+	protected.Get("/api/export/excel", ExportExcel)
+
 	// Log management API routes
 	protected.Get("/api/logs/stats", GetLogStatsAPI)
 	protected.Post("/api/logs/rotate", RotateLogsAPI)
-} 
+}

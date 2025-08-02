@@ -104,7 +104,7 @@ func GetWeeklyReports(c *fiber.Ctx) error {
 // ExportExcel generates Excel export for user data
 func ExportExcel(c *fiber.Ctx) error {
 	reportType := c.Query("type", "users")
-	
+
 	switch reportType {
 	case "users":
 		return exportUsersExcel(c)
@@ -128,14 +128,14 @@ func exportUsersExcel(c *fiber.Ctx) error {
 
 	// Create CSV content (simplified Excel export)
 	csvContent := "Name,Email,Total Working Time (hours),Weekly Hours,Monthly Hours,Last Activity,Currently Working\n"
-	
+
 	for _, summary := range summaries {
 		totalHours := float64(summary.TotalWorkingTime) / 3600.0
 		workingStatus := "No"
 		if summary.IsCurrentlyWorking {
 			workingStatus = "Yes"
 		}
-		
+
 		csvContent += fmt.Sprintf("%s,%s,%.2f,%.2f,%.2f,%s,%s\n",
 			summary.Name,
 			summary.Email,
@@ -147,9 +147,11 @@ func exportUsersExcel(c *fiber.Ctx) error {
 		)
 	}
 
-	c.Set("Content-Type", "text/csv")
+	// Set proper headers for file download
+	c.Set("Content-Type", "application/octet-stream")
 	c.Set("Content-Disposition", fmt.Sprintf("attachment; filename=users_report_%s.csv", time.Now().Format("2006-01-02")))
-	
+	c.Set("Content-Length", fmt.Sprintf("%d", len(csvContent)))
+
 	return c.SendString(csvContent)
 }
 
@@ -180,7 +182,7 @@ func exportWeeklyExcel(c *fiber.Ctx) error {
 
 	// Create CSV content
 	csvContent := "Name,Email,Week Start,Week End,Total Hours,Required Hours,Completion Rate (%)\n"
-	
+
 	for _, report := range reports {
 		csvContent += fmt.Sprintf("%s,%s,%s,%s,%.2f,%.2f,%.2f\n",
 			report.Name,
@@ -193,9 +195,11 @@ func exportWeeklyExcel(c *fiber.Ctx) error {
 		)
 	}
 
-	c.Set("Content-Type", "text/csv")
+	// Set proper headers for file download
+	c.Set("Content-Type", "application/octet-stream")
 	c.Set("Content-Disposition", fmt.Sprintf("attachment; filename=weekly_report_%s.csv", weekStart.Format("2006-01-02")))
-	
+	c.Set("Content-Length", fmt.Sprintf("%d", len(csvContent)))
+
 	return c.SendString(csvContent)
 }
 
@@ -261,10 +265,10 @@ func calculateAnalytics(summaries []database.UserSummary) map[string]interface{}
 	// Calculate completion rates (based on 20 hours per week requirement)
 	weeklyTarget := 20.0 * float64(totalUsers)
 	monthlyTarget := 80.0 * float64(totalUsers) // 4 weeks
-	
+
 	weeklyCompletion := 0.0
 	monthlyCompletion := 0.0
-	
+
 	if weeklyTarget > 0 {
 		weeklyCompletion = (totalWeeklyHours / weeklyTarget) * 100
 	}
@@ -283,18 +287,18 @@ func calculateAnalytics(summaries []database.UserSummary) map[string]interface{}
 		"weekly_completion":   weeklyCompletion,
 		"monthly_completion":  monthlyCompletion,
 	}
-} 
+}
 
 // GetLogStatsAPI returns logging statistics and configuration
 func GetLogStatsAPI(c *fiber.Ctx) error {
 	stats := utils.GetLogStats()
-	
+
 	// Add additional runtime information
 	stats["verbose_logging_enabled"] = utils.IsVerboseEnabled()
-	
+
 	return c.JSON(fiber.Map{
 		"log_statistics": stats,
-		"status": "active",
+		"status":         "active",
 	})
 }
 
@@ -303,16 +307,16 @@ func RotateLogsAPI(c *fiber.Ctx) error {
 	err := utils.RotateLogs()
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to rotate logs",
+			"error":   "Failed to rotate logs",
 			"details": err.Error(),
 		})
 	}
 
 	// Get updated stats after rotation
 	stats := utils.GetLogStats()
-	
+
 	return c.JSON(fiber.Map{
-		"message": "Log rotation completed successfully",
+		"message":   "Log rotation completed successfully",
 		"new_stats": stats,
 	})
-} 
+}
