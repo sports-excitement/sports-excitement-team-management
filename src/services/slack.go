@@ -374,7 +374,7 @@ func (s *SlackService) isNotWorkingStatus(statusEmoji, statusText string) bool {
 
 	notWorkingKeywords := []string{
 		"lunch", "break", "away", "out", "offline",
-		"vacation", "sick", "commuting",
+		"vacation", "sick", "commuting", "meeting", "call",
 		"traveling", "afk", "be right back", "brb",
 	}
 
