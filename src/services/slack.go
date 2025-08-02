@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 
 	"sports-excitement-team-management/src/config"
@@ -55,6 +56,11 @@ func (s *SlackService) Start() {
 
 			case socketmode.EventTypeEventsAPI:
 				utils.LogVerbose("Event received: %+v", evt)
+
+				// Process the event
+				go s.processSlackEvent(evt)
+
+				// Acknowledge the event
 				s.socketClient.Ack(*evt.Request)
 
 			case socketmode.EventTypeInteractive:
@@ -69,6 +75,207 @@ func (s *SlackService) Start() {
 	}()
 
 	s.socketClient.Run()
+}
+
+// processSlackEvent processes incoming Slack events
+func (s *SlackService) processSlackEvent(evt socketmode.Event) {
+	eventsAPIEvent, ok := evt.Data.(slackevents.EventsAPIEvent)
+	if !ok {
+		utils.LogVerbose("Event is not an EventsAPIEvent")
+		return
+	}
+
+	switch eventsAPIEvent.Type {
+	case slackevents.CallbackEvent:
+		innerEvent := eventsAPIEvent.InnerEvent
+		switch ev := innerEvent.Data.(type) {
+		case *slackevents.UserStatusChangedEvent:
+			utils.LogVerbose("User status changed event: %+v", ev)
+			s.handleUserStatusChanged(&ev.User)
+
+			// Note: Commenting out UserChangeEvent to avoid duplicate processing
+			// UserChangeEvent includes status changes which are already handled by UserStatusChangedEvent
+			/*
+				case *slackevents.UserChangeEvent:
+					utils.LogVerbose("User change event: %+v", ev.User)
+					s.handleUserChanged(&ev.User)
+			*/
+		}
+	}
+}
+
+// handleUserStatusChanged processes user status change events
+func (s *SlackService) handleUserStatusChanged(user *slackevents.User) {
+	// Get user info to check current status and presence
+	userInfo, err := s.client.GetUserInfo(user.ID)
+	if err != nil {
+		utils.LogError("Error getting user info for status change %s: %v", user.ID, err)
+		return
+	}
+
+	if userInfo.Profile.Email == "" {
+		utils.LogVerbose("No email found for user %s, skipping status change", user.ID)
+		return
+	}
+
+	// Check if user is actually online/active in Slack
+	// Handle cases where presence might be empty or unavailable
+	isUserActive := userInfo.Presence == "active"
+	if userInfo.Presence == "" {
+		// If presence is unavailable, we'll process the status change but log it
+		utils.LogVerbose("User %s presence unavailable, processing status change anyway", userInfo.Name)
+		isUserActive = true // Assume active if we can't determine presence
+	}
+
+	if !isUserActive {
+		utils.LogVerbose("User %s is not active in Slack (presence: %s), marking as offline", userInfo.Name, userInfo.Presence)
+
+		// Find or create user in database for record keeping
+		dbUser, err := database.CreateOrUpdateUser(
+			user.ID,
+			userInfo.Name,
+			userInfo.Profile.Email,
+			userInfo.RealName,
+			userInfo.Profile.Image192,
+		)
+		if err != nil {
+			utils.LogError("Error creating/updating user: %v", err)
+			return
+		}
+
+		// End any active time entries since user is offline
+		err = database.EndTimeEntry(dbUser.ID)
+		if err != nil {
+			utils.LogError("Error ending time entry for offline user: %v", err)
+		}
+
+		// Create status record for offline state
+		s.processUserStatusChange(dbUser, "", "offline", false)
+		return
+	}
+
+	// Find or create user in database
+	dbUser, err := database.CreateOrUpdateUser(
+		user.ID,
+		userInfo.Name,
+		userInfo.Profile.Email,
+		userInfo.RealName,
+		userInfo.Profile.Image192,
+	)
+	if err != nil {
+		utils.LogError("Error creating/updating user during status change: %v", err)
+		return
+	}
+
+	// Update last activity
+	err = database.UpdateUserLastActivity(dbUser.ID)
+	if err != nil {
+		utils.LogError("Error updating user last activity: %v", err)
+	}
+
+	// Process status change with presence validation
+	s.processUserStatusChange(dbUser, userInfo.Profile.StatusEmoji, userInfo.Profile.StatusText, true)
+}
+
+// handleUserChanged processes user change events (includes status changes)
+func (s *SlackService) handleUserChanged(user *slackevents.User) {
+	// Get fresh user info to access complete profile
+	userInfo, err := s.client.GetUserInfo(user.ID)
+	if err != nil {
+		utils.LogError("Error getting user info for user change %s: %v", user.ID, err)
+		return
+	}
+
+	if userInfo.Profile.Email == "" {
+		utils.LogVerbose("No email found for user %s, skipping user change", user.ID)
+		return
+	}
+
+	// Find or create user in database
+	dbUser, err := database.CreateOrUpdateUser(
+		user.ID,
+		userInfo.Name,
+		userInfo.Profile.Email,
+		userInfo.RealName,
+		userInfo.Profile.Image192,
+	)
+	if err != nil {
+		utils.LogError("Error creating/updating user during user change: %v", err)
+		return
+	}
+
+	// Update last activity
+	err = database.UpdateUserLastActivity(dbUser.ID)
+	if err != nil {
+		utils.LogError("Error updating user last activity: %v", err)
+	}
+
+	// Process status change
+	s.processUserStatusChange(dbUser, userInfo.Profile.StatusEmoji, userInfo.Profile.StatusText, true)
+}
+
+// processUserStatusChange handles the logic for status changes with deduplication
+func (s *SlackService) processUserStatusChange(dbUser *database.User, statusEmoji, statusText string, isOnline bool) {
+	// Check if this is actually a status change by comparing with latest status
+	latestStatus, err := database.GetLatestUserStatus(dbUser.ID)
+	if err == nil {
+		// If same status as before, skip processing to avoid duplicates
+		if latestStatus.StatusEmoji == statusEmoji && latestStatus.StatusText == statusText {
+			utils.LogVerbose("User %s status unchanged (%s %s), skipping duplicate processing", dbUser.Name, statusEmoji, statusText)
+			return
+		}
+	}
+
+	var isWorking bool
+	if !isOnline {
+		// If user is offline, they're definitely not working
+		isWorking = false
+		statusText = "offline"
+		statusEmoji = ""
+	} else {
+		// Only check working status if user is online
+		isWorking = s.isWorkingStatus(statusEmoji, statusText)
+		isNotWorking := s.isNotWorkingStatus(statusEmoji, statusText)
+
+		// If explicitly not working, set to false
+		if isNotWorking {
+			isWorking = false
+		}
+	}
+
+	// Store status change in database only if it's different from previous
+	_, err = database.CreateUserStatus(dbUser.ID, statusEmoji, statusText, isWorking)
+	if err != nil {
+		utils.LogError("Error creating user status record: %v", err)
+		return
+	}
+
+	if isWorking && isOnline {
+		utils.LogInfo("User %s started working with status: %s %s", dbUser.Name, statusEmoji, statusText)
+
+		_, err := database.StartTimeEntry(dbUser.ID, "Working", statusText, statusEmoji)
+		if err != nil {
+			utils.LogError("Error starting time entry: %v", err)
+		}
+	} else if !isWorking {
+		if !isOnline {
+			utils.LogInfo("User %s went offline", dbUser.Name)
+		} else {
+			utils.LogInfo("User %s stopped working with status: %s %s", dbUser.Name, statusEmoji, statusText)
+		}
+
+		err := database.EndTimeEntry(dbUser.ID)
+		if err != nil {
+			utils.LogError("Error ending time entry: %v", err)
+		}
+	} else {
+		utils.LogVerbose("User %s has neutral status: %s %s - maintaining current state", dbUser.Name, statusEmoji, statusText)
+	}
+
+	// Broadcast user update
+	if globalHub != nil {
+		globalHub.BroadcastUserUpdate(dbUser.ID)
+	}
 }
 
 // SyncUsers synchronizes all users from Slack to the database
@@ -105,79 +312,24 @@ func (s *SlackService) SyncUsers() error {
 	return nil
 }
 
+// NOTE: CheckUserStatuses and checkUserStatus functions have been disabled
+// to prevent conflicts with real-time event processing.
+// All status changes are now handled via WebSocket events in real-time.
+
+/*
 func (s *SlackService) CheckUserStatuses() error {
-	users, err := s.client.GetUsers()
-	if err != nil {
-		utils.LogError("Error getting user list for status check: %v", err)
-		return err
-	}
-
-	for _, user := range users {
-		if user.IsBot || user.Deleted {
-			continue
-		}
-		s.checkUserStatus(user.ID)
-	}
-
+	// DISABLED: This function conflicted with real-time event processing
+	// causing duplicate status records and incorrect working states
+	utils.LogVerbose("Periodic status checking disabled - using real-time events only")
 	return nil
 }
 
 func (s *SlackService) checkUserStatus(userID string) {
-	utils.LogVerbose("Checking user status for user: %s", userID)
-
-	// Get user info to access profile
-	userInfo, err := s.client.GetUserInfo(userID)
-	if err != nil {
-		utils.LogError("Error getting user info for %s: %v", userID, err)
-		return
-	}
-
-	if userInfo.Profile.Email == "" {
-		utils.LogVerbose("No email found for user %s, skipping", userID)
-		return
-	}
-
-	// Create or update user in database using existing function
-	dbUser, err := database.CreateOrUpdateUser(
-		userID,
-		userInfo.Name,
-		userInfo.Profile.Email,
-		userInfo.RealName,
-		userInfo.Profile.Image192,
-	)
-	if err != nil {
-		utils.LogError("Error creating/updating user: %v", err)
-		return
-	}
-
-	// Check if user is currently working based on status
-	statusEmoji := userInfo.Profile.StatusEmoji
-	status := userInfo.Profile.StatusText
-	isWorking := s.isWorkingStatus(statusEmoji, status)
-
-	if isWorking {
-		utils.LogInfo("User %s started working with status: %s %s", userInfo.Name, statusEmoji, status)
-		
-		_, err := database.StartTimeEntry(dbUser.ID, "Working", status, statusEmoji)
-		if err != nil {
-			utils.LogError("Error starting time entry: %v", err)
-		}
-	} else if s.isNotWorkingStatus(statusEmoji, status) {
-		utils.LogInfo("User %s stopped working with status: %s %s", userInfo.Name, statusEmoji, status)
-		
-		err := database.EndTimeEntry(dbUser.ID)
-		if err != nil {
-			utils.LogError("Error ending time entry: %v", err)
-		}
-	} else {
-		utils.LogVerbose("User %s has neutral status: %s %s - maintaining current state", userInfo.Name, statusEmoji, status)
-	}
-
-	// Broadcast user update
-	if globalHub != nil {
-		globalHub.BroadcastUserUpdate(dbUser.ID)
-	}
+	// DISABLED: This function has been replaced by real-time event handlers
+	// that provide more accurate and immediate status tracking
+	utils.LogVerbose("Manual status checking disabled - using real-time events only")
 }
+*/
 
 // isWorkingStatus checks if the status indicates the user is working
 func (s *SlackService) isWorkingStatus(statusEmoji, statusText string) bool {
@@ -194,7 +346,7 @@ func (s *SlackService) isWorkingStatus(statusEmoji, statusText string) bool {
 	workingEmojis := []string{
 		":computer:", ":laptop:", ":desktop_computer:", ":keyboard:",
 		":coffee:", ":construction:", ":wrench:", ":hammer:",
-		":gear:", ":bulb:", ":pencil:", ":memo:",
+		":gear:", ":bulb:", ":pencil:", ":memo:", ":working:",
 	}
 
 	// Check status text
@@ -222,7 +374,7 @@ func (s *SlackService) isNotWorkingStatus(statusEmoji, statusText string) bool {
 
 	notWorkingKeywords := []string{
 		"lunch", "break", "away", "out", "offline",
-		"vacation", "sick", "meeting", "commuting",
+		"vacation", "sick", "commuting", "meeting", "call",
 		"traveling", "afk", "be right back", "brb",
 	}
 
@@ -231,6 +383,7 @@ func (s *SlackService) isNotWorkingStatus(statusEmoji, statusText string) bool {
 		":away:", ":zzz:", ":sleeping:", ":bed:",
 		":car:", ":bus:", ":train:", ":airplane:",
 		":face_with_thermometer:", ":sick:", ":sneezing_face:",
+		":no_entry:", ":palm_tree:", ":spiral_calendar:",
 	}
 
 	// Check status text
@@ -256,25 +409,11 @@ func (s *SlackService) StartWithInitialSync() {
 		utils.LogError("Error during initial user sync: %v", err)
 	}
 
-	utils.LogInfo("Checking initial user statuses...")
-	if err := s.CheckUserStatuses(); err != nil {
-		utils.LogError("Error checking initial user statuses: %v", err)
-	}
+	// NOTE: Removed periodic status checking to avoid conflicts with real-time events
+	// Real-time events via WebSocket will handle all status changes
+	utils.LogInfo("Real-time status tracking enabled via WebSocket events")
 
-	// Start the periodic status check
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			utils.LogVerbose("Performing periodic user status check...")
-			if err := s.CheckUserStatuses(); err != nil {
-				utils.LogError("Error during periodic status check: %v", err)
-			}
-		}
-	}()
-
-	// Start periodic duration updates
+	// Start periodic duration updates only
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -302,7 +441,7 @@ func (s *SlackService) updateActiveDurations() {
 		}
 
 		duration := int64(now.Sub(entry.StartTime).Seconds())
-		
+
 		// Update duration in database
 		err := database.DB.Model(&entry).Update("duration", duration).Error
 		if err != nil {
@@ -317,4 +456,4 @@ func (s *SlackService) updateActiveDurations() {
 	}
 
 	utils.LogVerbose("Updated %d active time entries", len(activeEntries))
-} 
+}

@@ -50,6 +50,7 @@ func Initialize() {
 	err = DB.AutoMigrate(
 		&User{},
 		&TimeEntry{},
+		&UserStatus{},
 		&Admin{},
 		&Session{},
 	)
@@ -114,14 +115,17 @@ func GetUserSummaries() ([]UserSummary, error) {
 			COALESCE(NULLIF(u.real_name, ''), u.name) as name,
 			u.email,
 			COALESCE(SUM(te.duration), 0) as total_working_time,
-			COALESCE(MAX(te.updated_at), u.created_at) as last_activity,
+			COALESCE(MAX(u.updated_at), u.created_at) as last_activity,
 			CASE WHEN EXISTS(
-				SELECT 1 FROM time_entries te2 
-				WHERE te2.user_id = u.id 
-				AND te2.end_time IS NULL 
-				AND te2.status = 'Working'
+				SELECT 1 FROM user_statuses us
+				WHERE us.user_id = u.id 
+				AND us.is_working = 1
+				AND us.id = (
+					SELECT MAX(us2.id) FROM user_statuses us2 
+					WHERE us2.user_id = u.id
+				)
 			) THEN 1 ELSE 0 END as is_currently_working,
-			COALESCE(te_current.status, '') as current_status,
+			COALESCE(us_current.status_text, '') as current_status,
 			COALESCE(SUM(CASE 
 				WHEN te.start_time >= date('now', '-7 days') 
 				THEN te.duration ELSE 0 
@@ -133,12 +137,12 @@ func GetUserSummaries() ([]UserSummary, error) {
 		FROM users u
 		LEFT JOIN time_entries te ON u.id = te.user_id
 		LEFT JOIN (
-			SELECT DISTINCT user_id, status,
-			ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY updated_at DESC) as rn
-			FROM time_entries
-		) te_current ON u.id = te_current.user_id AND te_current.rn = 1
+			SELECT DISTINCT user_id, status_text,
+			ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY timestamp DESC) as rn
+			FROM user_statuses
+		) us_current ON u.id = us_current.user_id AND us_current.rn = 1
 		WHERE u.is_active = 1
-		GROUP BY u.id, u.name, u.email, te_current.status
+		GROUP BY u.id, u.name, u.email, us_current.status_text
 		ORDER BY u.name
 	`
 
@@ -326,6 +330,102 @@ func EndTimeEntry(userID uint) error {
 	entry.Duration = int64(duration)
 
 	return DB.Save(&entry).Error
+}
+
+// CreateUserStatus creates a new user status record
+func CreateUserStatus(userID uint, statusEmoji, statusText string, isWorking bool) (*UserStatus, error) {
+	status := UserStatus{
+		UserID:      userID,
+		StatusEmoji: statusEmoji,
+		StatusText:  statusText,
+		IsWorking:   isWorking,
+		Timestamp:   time.Now(),
+	}
+
+	err := DB.Create(&status).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return &status, nil
+}
+
+// GetLatestUserStatus returns the most recent status for a user
+func GetLatestUserStatus(userID uint) (*UserStatus, error) {
+	var status UserStatus
+	err := DB.Where("user_id = ?", userID).Order("timestamp DESC").First(&status).Error
+	if err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+// GetUserCurrentWorkingStatus checks if user is currently working based on latest status
+func GetUserCurrentWorkingStatus(userID uint) (bool, error) {
+	latestStatus, err := GetLatestUserStatus(userID)
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return false, nil // No status recorded, assume not working
+		}
+		return false, err
+	}
+	return latestStatus.IsWorking, nil
+}
+
+// UpdateUserLastActivity updates user's last activity timestamp
+func UpdateUserLastActivity(userID uint) error {
+	return DB.Model(&User{}).Where("id = ?", userID).Update("updated_at", time.Now()).Error
+}
+
+// CleanupDuplicateStatuses removes duplicate status entries keeping only the latest for each user
+func CleanupDuplicateStatuses() error {
+	utils.LogInfo("Starting cleanup of duplicate user status entries...")
+
+	// Get all users
+	var users []User
+	err := DB.Find(&users).Error
+	if err != nil {
+		return err
+	}
+
+	duplicatesRemoved := 0
+
+	for _, user := range users {
+		// Get all statuses for this user, ordered by timestamp DESC
+		var statuses []UserStatus
+		err := DB.Where("user_id = ?", user.ID).Order("timestamp DESC").Find(&statuses).Error
+		if err != nil {
+			continue
+		}
+
+		// Group by same status (emoji + text) and keep only the latest
+		seen := make(map[string]bool)
+		var toDelete []uint
+
+		for _, status := range statuses {
+			statusKey := status.StatusEmoji + "|" + status.StatusText
+			if seen[statusKey] {
+				// This is a duplicate, mark for deletion
+				toDelete = append(toDelete, status.ID)
+				duplicatesRemoved++
+			} else {
+				seen[statusKey] = true
+			}
+		}
+
+		// Delete duplicates
+		if len(toDelete) > 0 {
+			err := DB.Where("id IN ?", toDelete).Delete(&UserStatus{}).Error
+			if err != nil {
+				utils.LogError("Error deleting duplicate statuses for user %s: %v", user.Name, err)
+			} else {
+				utils.LogInfo("Removed %d duplicate status entries for user %s", len(toDelete), user.Name)
+			}
+		}
+	}
+
+	utils.LogInfo("Cleanup completed: removed %d duplicate status entries", duplicatesRemoved)
+	return nil
 }
 
 // GetUserSummary returns a single user summary by ID
